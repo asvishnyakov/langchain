@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import os
 import uuid
+from concurrent.futures import Future
 from typing import (
     Any,
     Callable,
@@ -19,16 +20,13 @@ from langchain_core.documents import Document
 from langchain_core.embeddings import Embeddings
 from langchain_core.utils.iter import batch_iterate
 from langchain_core.vectorstores import VectorStore
-from pinecone import Index, Pinecone as PineconeClient
 
 from langchain_pinecone._utilities import DistanceStrategy, maximal_marginal_relevance
 
 try:
-    from pinecone.grpc import GRPCIndex, PineconeGRPC as PineconeGRPCClient, PineconeGrpcFuture
+    from pinecone.grpc import GRPCIndex as Index, PineconeGRPC as PineconeClient
 except ImportError:
-    GRPCIndex = None
-    PineconeGRPCClient = None
-    PineconeGrpcFuture = None
+    from pinecone import Index, Pinecone as PineconeClient
 
 logger = logging.getLogger(__name__)
 
@@ -178,7 +176,7 @@ class PineconeVectorStore(VectorStore):
         # the index and embedding objects - manually throw
         # exceptions if they are not passed in or set in environment
         # (keeping param for backwards compatibility)
-        index: Optional[Index | GRPCIndex] = None,
+        index: Optional[Index] = None,
         embedding: Optional[Embeddings] = None,
         text_key: Optional[str] = "text",
         namespace: Optional[str] = None,
@@ -219,10 +217,7 @@ class PineconeVectorStore(VectorStore):
                 )
 
             # needs
-            if PineconeGRPCClient:
-                client = PineconeGRPCClient(api_key=_pinecone_api_key, source_tag="langchain")
-            else:
-                client = PineconeClient(api_key=_pinecone_api_key, source_tag="langchain")
+            client = PineconeClient(api_key=_pinecone_api_key, source_tag="langchain")
             self._index = client.Index(_index_name)
 
     @property
@@ -296,7 +291,7 @@ class PineconeVectorStore(VectorStore):
                     )
                     for batch_vector_tuples in batch_iterate(batch_size, vector_tuples)
                 ]
-                [res.result() if PineconeGrpcFuture is not None and isinstance(res, PineconeGrpcFuture) else res.get() for res in async_res]
+                [res.result() if isinstance(res, Future) else res.get() for res in async_res]
             else:
                 self._index.upsert(
                     vectors=vector_tuples,
