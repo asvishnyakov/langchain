@@ -79,6 +79,9 @@ simsimd = "^5.0.0"
 path = "../../core"
 develop = true
 
+[tool.poetry.group.test_integration.dependencies]
+pinecone = { version = "^5.4.0", extras = ["grpc"] }
+
 [tool.poetry.group.test_integration.dependencies.langchain-openai]
 path = "../openai"
 develop = true
