@@ -4,7 +4,6 @@ import logging
 import os
 import uuid
 from typing import (
-    TYPE_CHECKING,
     Any,
     Callable,
     Iterable,
@@ -20,12 +19,16 @@ from langchain_core.documents import Document
 from langchain_core.embeddings import Embeddings
 from langchain_core.utils.iter import batch_iterate
 from langchain_core.vectorstores import VectorStore
-from pinecone import Pinecone as PineconeClient  # type: ignore
+from pinecone import Index, Pinecone as PineconeClient
 
 from langchain_pinecone._utilities import DistanceStrategy, maximal_marginal_relevance
 
-if TYPE_CHECKING:
-    from pinecone import Index
+try:
+    from pinecone.grpc import GRPCIndex, PineconeGRPC as PineconeGRPCClient, PineconeGrpcFuture
+except ImportError:
+    GRPCIndex = None
+    PineconeGRPCClient = None
+    PineconeGrpcFuture = None
 
 logger = logging.getLogger(__name__)
 
@@ -175,7 +178,7 @@ class PineconeVectorStore(VectorStore):
         # the index and embedding objects - manually throw
         # exceptions if they are not passed in or set in environment
         # (keeping param for backwards compatibility)
-        index: Optional[Any] = None,
+        index: Optional[Index | GRPCIndex] = None,
         embedding: Optional[Embeddings] = None,
         text_key: Optional[str] = "text",
         namespace: Optional[str] = None,
@@ -216,7 +219,10 @@ class PineconeVectorStore(VectorStore):
                 )
 
             # needs
-            client = PineconeClient(api_key=_pinecone_api_key, source_tag="langchain")
+            if PineconeGRPCClient:
+                client = PineconeGRPCClient(api_key=_pinecone_api_key, source_tag="langchain")
+            else:
+                client = PineconeClient(api_key=_pinecone_api_key, source_tag="langchain")
             self._index = client.Index(_index_name)
 
     @property
@@ -290,7 +296,7 @@ class PineconeVectorStore(VectorStore):
                     )
                     for batch_vector_tuples in batch_iterate(batch_size, vector_tuples)
                 ]
-                [res.get() for res in async_res]
+                [res.result() if PineconeGrpcFuture is not None and isinstance(res, PineconeGrpcFuture) else res.get() for res in async_res]
             else:
                 self._index.upsert(
                     vectors=vector_tuples,

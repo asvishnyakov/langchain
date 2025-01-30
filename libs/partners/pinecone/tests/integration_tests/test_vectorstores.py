@@ -21,15 +21,15 @@ DIMENSION = 1536  # dimension of the embeddings
 DEFAULT_SLEEP = 20
 
 
+@pytest.mark.parametrize("PineconeClient", [pinecone.Pinecone, pinecone.grpc.PineconeGRPC])
 class TestPinecone(VectorStoreIntegrationTests):
     index: "pinecone.Index"
     pc: "pinecone.Pinecone"
 
     @classmethod
-    def setup_class(self) -> None:
-        import pinecone
+    def setup_class(self, PineconeClient) -> None:
 
-        client = pinecone.Pinecone(api_key=os.environ["PINECONE_API_KEY"])
+        client = PineconeClient(api_key=os.environ["PINECONE_API_KEY"])
         index_list = client.list_indexes()
         if INDEX_NAME in [
             i["name"] for i in index_list
