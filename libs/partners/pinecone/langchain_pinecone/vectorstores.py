@@ -4,6 +4,7 @@ import logging
 import os
 import uuid
 from concurrent.futures import Future
+from copy import deepcopy
 from typing import (
     Any,
     Callable,
@@ -267,7 +268,7 @@ class PineconeVectorStore(VectorStore):
             ids = [
                 id_prefix + "#" + id if id_prefix + "#" not in id else id for id in ids
             ]
-        metadatas = metadatas or [{} for _ in texts]
+        metadatas = deepcopy(metadatas) if metadatas else [{} for _ in texts] # Do not mutate provided metadata
         for metadata, text in zip(metadatas, texts):
             metadata[self._text_key] = text
 

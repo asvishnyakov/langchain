@@ -3,6 +3,7 @@
 # Please do not add additional fake embedding model implementations here.
 import hashlib
 
+from numpy import float32
 from pydantic import BaseModel
 
 from langchain_core.embeddings import Embeddings
@@ -110,7 +111,7 @@ class DeterministicFakeEmbedding(Embeddings, BaseModel):
 
         # set the seed for the random generator
         rng = np.random.default_rng(seed)
-        return list(rng.normal(size=self.size))
+        return list([float(float32(value))for value in rng.normal(size=self.size)])
 
     def _get_seed(self, text: str) -> int:
         """Get a seed for the random generator, using the hash of the text."""

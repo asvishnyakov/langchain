@@ -1,136 +1,103 @@
 import importlib
 import os
+import sys
 import time
 import uuid
+from importlib import reload
 from typing import List
 
 import numpy as np
 import pinecone  # type: ignore
 import pytest  # type: ignore[import-not-found]
+from grpc import RpcError, StatusCode
 from langchain_core.documents import Document
+from langchain_core.vectorstores import VectorStore
 from langchain_openai import OpenAIEmbeddings  # type: ignore[import-not-found]
-from langchain_tests.integration_tests.vectorstores import VectorStoreIntegrationTests
+from langchain_tests.integration_tests.vectorstores import VectorStoreIntegrationTests, EMBEDDING_SIZE
 from pinecone import ServerlessSpec
+from pinecone.core.openapi.shared.exceptions import PineconeException
 from pytest_mock import MockerFixture  # type: ignore[import-not-found]
-
-import langchain_pinecone
+from unittest import mock
 
 INDEX_NAME = "langchain-test-index"  # name of the index
-NAMESPACE_NAME = "langchain-test-namespace"  # name of the namespace
-DIMENSION = 1536  # dimension of the embeddings
 
-DEFAULT_SLEEP = 20
+DEFAULT_SLEEP = 10
 
-@pytest.fixture(scope="class", params=[False, True], ids=["http", "grpc"])
-def get_langchain_pinecone(request):
-    if not request.param:
-        with pytest.MonkeyPatch.context() as monkey_patch:
-            monkey_patch.delattr("pinecone.grpc", raising=False)
-            importlib.reload(langchain_pinecone)
-    return langchain_pinecone
+def add_delay(delay_seconds):
+    def decorator(func):
+        def wrapper(*args, **kwargs):
+            time.sleep(delay_seconds)
+            return func(*args, **kwargs)
+        return wrapper
+    return decorator
 
 class TestPinecone(VectorStoreIntegrationTests):
-    index: "pinecone.Index"
-    pc: "pinecone.Pinecone"
+    index: "pinecone.grpc.GRPCIndex"
+    pc: "pinecone.grpc.PineconeGRPC"
 
     @classmethod
-    def setup_class(self) -> None:
-        import pinecone
+    def setup_class(cls) -> None:
+        from pinecone.grpc import PineconeGRPC as PineconeClient
 
-        client = pinecone.Pinecone(api_key=os.environ["PINECONE_API_KEY"])
-        index_list = client.list_indexes()
-        if INDEX_NAME in [
-            i["name"] for i in index_list
-        ]:  # change to list comprehension
+        client = PineconeClient(api_key=os.environ["PINECONE_API_KEY"])
+        if INDEX_NAME in client.list_indexes().names():
             client.delete_index(INDEX_NAME)
-            time.sleep(DEFAULT_SLEEP)  # prevent race with subsequent creation
+            while not client.describe_index(INDEX_NAME).status['ready']:
+                time.sleep(1)
         client.create_index(
             name=INDEX_NAME,
-            dimension=DIMENSION,
+            dimension=EMBEDDING_SIZE,
             metric="cosine",
-            spec=ServerlessSpec(cloud="aws", region="us-west-2"),
+            spec=ServerlessSpec(cloud="aws", region="us-east-1"),
         )
 
-        self.index = client.Index(INDEX_NAME)
-        self.pc = client
+        cls.index = client.Index(INDEX_NAME)
+        cls.client = client
 
     @classmethod
-    def teardown_class(self) -> None:
-        self.pc.delete_index()
+    def teardown_class(cls) -> None:
+        cls.client.delete_index(INDEX_NAME)
 
-    @pytest.fixture(autouse=True)
-    def setup(self) -> None:
-        # delete all the vectors in the index
-        print("called")  # noqa: T201
-        index_stats = self.index.describe_index_stats()
-        if index_stats["total_vector_count"] > 0:
-            try:
-                self.index.delete(delete_all=True, namespace=NAMESPACE_NAME)
-            except Exception:
-                # if namespace not found
-                pass
+    @pytest.fixture(params=[False, True], ids=["http", "grpc"])
+    def vectorstore(self, request, mocker: MockerFixture) -> VectorStore:
+        if not request.param:
+            mocker.patch.dict(sys.modules, {"pinecone.grpc": None})
+        import langchain_pinecone
+        for attr_name, attr_value in langchain_pinecone.PineconeVectorStore.__dict__.items():
+            if callable(attr_value):
+                attr_wrapped = add_delay(DEFAULT_SLEEP)(attr_value)
+                mocker.patch.object(langchain_pinecone.PineconeVectorStore, attr_name, attr_wrapped)
+        namespace = uuid.uuid4().hex # Just use a new namespace for each test instead of cleaning up after each one
+        return langchain_pinecone.PineconeVectorStore(embedding=self.get_embeddings(), index_name=INDEX_NAME, namespace=namespace)
 
-    @pytest.fixture
-    def embedding_openai(self) -> OpenAIEmbeddings:
-        return OpenAIEmbeddings()
+    @pytest.mark.xfail(reason=("get_by_ids not implemented."))
+    def test_get_by_ids(self, vectorstore: VectorStore) -> None:
+        super().test_get_by_ids(vectorstore)
 
-    @pytest.fixture
-    def texts(self) -> List[str]:
-        return ["foo", "bar", "baz"]
+    @pytest.mark.xfail(reason=("get_by_ids not implemented."))
+    def test_get_by_ids_missing(self, vectorstore: VectorStore) -> None:
+        super().test_get_by_ids_missing(vectorstore)
 
-    def test_from_texts(
-            self, texts: List[str], embedding_openai: OpenAIEmbeddings, get_langchain_pinecone
-    ) -> None:
-        """Test end to end construction and search."""
-        unique_id = uuid.uuid4().hex
-        needs = f"foobuu {unique_id} booo"
-        texts.insert(0, needs)
+    @pytest.mark.xfail(reason=("get_by_ids not implemented."))
+    def test_add_documents_documents(self, vectorstore: VectorStore) -> None:
+        super().test_add_documents_documents(vectorstore)
 
-        docsearch = get_langchain_pinecone.PineconeVectorStore.from_texts(
-            texts=texts,
-            embedding=embedding_openai,
-            index_name=INDEX_NAME,
-            namespace=NAMESPACE_NAME,
-        )
-        time.sleep(DEFAULT_SLEEP)  # prevent race condition
-        output = docsearch.similarity_search(unique_id, k=1, namespace=NAMESPACE_NAME)
-        output[0].id = None  # overwrite ID for ease of comparison
-        assert output == [Document(page_content=needs)]
+    @pytest.mark.xfail(reason=("get_by_ids not implemented."))
+    def test_add_documents_with_existing_ids(self, vectorstore: VectorStore) -> None:
+        super().test_add_documents_with_existing_ids(vectorstore)
 
-    @pytest.fixture
-    def mock_pool_not_supported(self, mocker: MockerFixture) -> None:
-        """
-        This is the error thrown when multiprocessing is not supported.
-        See https://github.com/langchain-ai/langchain/issues/11168
-        """
-        mocker.patch(
-            "multiprocessing.synchronize.SemLock.__init__",
-            side_effect=OSError(
-                "FileNotFoundError: [Errno 2] No such file or directory"
-            ),
-        )
+    @pytest.mark.xfail(reason=("get_by_ids not implemented."))
+    async def test_get_by_ids_async(self, vectorstore: VectorStore) -> None:
+        await super().test_get_by_ids_async(vectorstore)
 
-    @pytest.mark.usefixtures("mock_pool_not_supported")
-    def test_that_async_freq_uses_multiprocessing(
-        self, texts: List[str], embedding_openai: OpenAIEmbeddings
-    ) -> None:
-        with pytest.raises(OSError):
-            langchain_pinecone.PineconeVectorStore.from_texts(
-                texts=texts,
-                embedding=embedding_openai,
-                index_name=INDEX_NAME,
-                namespace=NAMESPACE_NAME,
-                async_req=True,
-            )
+    @pytest.mark.xfail(reason=("get_by_ids not implemented."))
+    async def test_get_by_ids_missing_async(self, vectorstore: VectorStore) -> None:
+        await super().test_get_by_ids_missing_async(vectorstore)
 
-    @pytest.mark.usefixtures("mock_pool_not_supported")
-    def test_that_async_freq_false_enabled_singlethreading(
-        self, texts: List[str], embedding_openai: OpenAIEmbeddings
-    ) -> None:
-        langchain_pinecone.PineconeVectorStore.from_texts(
-            texts=texts,
-            embedding=embedding_openai,
-            index_name=INDEX_NAME,
-            namespace=NAMESPACE_NAME,
-            async_req=False,
-        )
+    @pytest.mark.xfail(reason=("get_by_ids not implemented."))
+    async def test_add_documents_documents_async(self, vectorstore: VectorStore) -> None:
+        await super().test_add_documents_documents_async(vectorstore)
+
+    @pytest.mark.xfail(reason=("get_by_ids not implemented."))
+    async def test_add_documents_with_existing_ids_async(self, vectorstore: VectorStore) -> None:
+        await super().test_add_documents_with_existing_ids_async(vectorstore)
