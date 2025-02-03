@@ -3,7 +3,6 @@ from __future__ import annotations
 import logging
 import os
 import uuid
-from concurrent.futures import Future
 from copy import deepcopy
 from typing import (
     Any,
@@ -22,12 +21,16 @@ from langchain_core.embeddings import Embeddings
 from langchain_core.utils.iter import batch_iterate
 from langchain_core.vectorstores import VectorStore
 
-from langchain_pinecone._utilities import DistanceStrategy, maximal_marginal_relevance
+from langchain_pinecone._utilities import DistanceStrategy, maximal_marginal_relevance, wait_result
 
 try:
+    from grpc import RpcError, StatusCode
     from pinecone.grpc import GRPCIndex as Index, PineconeGRPC as PineconeClient
+    NotFoundException = None
 except ImportError:
+    RpcError, StatusCode = None, None
     from pinecone import Index, Pinecone as PineconeClient
+    from pinecone.core.openapi.shared.exceptions import NotFoundException
 
 logger = logging.getLogger(__name__)
 
@@ -281,25 +284,16 @@ class PineconeVectorStore(VectorStore):
             chunk_metadatas = metadatas[i : i + embedding_chunk_size]
             embeddings = self._embedding.embed_documents(chunk_texts)
             vector_tuples = zip(chunk_ids, embeddings, chunk_metadatas)
-            if async_req:
-                # Runs the pinecone upsert asynchronously.
-                async_res = [
-                    self._index.upsert(
-                        vectors=batch_vector_tuples,
-                        namespace=namespace,
-                        async_req=async_req,
-                        **kwargs,
-                    )
-                    for batch_vector_tuples in batch_iterate(batch_size, vector_tuples)
-                ]
-                [res.result() if isinstance(res, Future) else res.get() for res in async_res]
-            else:
+            responses = [
                 self._index.upsert(
-                    vectors=vector_tuples,
+                    vectors=batch_vector_tuples,
                     namespace=namespace,
                     async_req=async_req,
                     **kwargs,
                 )
+                for batch_vector_tuples in batch_iterate(batch_size, vector_tuples)
+            ]
+            [wait_result(response, async_req) for response in responses]
 
         return ids
 
@@ -332,25 +326,28 @@ class PineconeVectorStore(VectorStore):
         k: int = 4,
         filter: Optional[dict] = None,
         namespace: Optional[str] = None,
+        async_req: bool = True,
     ) -> List[Tuple[Document, float]]:
         """Return pinecone documents most similar to embedding, along with scores."""
 
         if namespace is None:
             namespace = self._namespace
         docs = []
-        results = self._index.query(
+        response = self._index.query(
             vector=embedding,
             top_k=k,
             include_metadata=True,
             namespace=namespace,
             filter=filter,
+            async_req=async_req,
         )
-        for res in results["matches"]:
-            metadata = res["metadata"]
-            id = res.get("id")
+        result = wait_result(response, async_req)
+        for res in result.matches:
+            metadata = res.metadata
+            id = res.id
             if self._text_key in metadata:
                 text = metadata.pop(self._text_key)
-                score = res["score"]
+                score = res.score
                 docs.append(
                     (Document(id=id, page_content=text, metadata=metadata), score)
                 )
@@ -419,6 +416,8 @@ class PineconeVectorStore(VectorStore):
         lambda_mult: float = 0.5,
         filter: Optional[dict] = None,
         namespace: Optional[str] = None,
+        *,
+        async_req: bool = True,
         **kwargs: Any,
     ) -> List[Document]:
         """Return docs selected using the maximal marginal relevance.
@@ -442,21 +441,23 @@ class PineconeVectorStore(VectorStore):
         """
         if namespace is None:
             namespace = self._namespace
-        results = self._index.query(
+        response = self._index.query(
             vector=[embedding],
             top_k=fetch_k,
             include_values=True,
             include_metadata=True,
             namespace=namespace,
             filter=filter,
+            async_req=async_req,
         )
+        result = wait_result(response, async_req)
         mmr_selected = maximal_marginal_relevance(
             np.array([embedding], dtype=np.float32),
-            [item["values"] for item in results["matches"]],
+            [item.values for item in result.matches],
             k=k,
             lambda_mult=lambda_mult,
         )
-        selected = [results["matches"][i]["metadata"] for i in mmr_selected]
+        selected = [result.matches[i].metadata for i in mmr_selected]
         return [
             Document(page_content=metadata.pop((self._text_key)), metadata=metadata)
             for metadata in selected
@@ -615,6 +616,9 @@ class PineconeVectorStore(VectorStore):
         delete_all: Optional[bool] = None,
         namespace: Optional[str] = None,
         filter: Optional[dict] = None,
+        batch_size: int = 1000,
+        *,
+        async_req: bool = True,
         **kwargs: Any,
     ) -> None:
         """Delete by vector IDs or filter.
@@ -623,22 +627,35 @@ class PineconeVectorStore(VectorStore):
             delete_all: Whether delete all vectors in the index.
             filter: Dictionary of conditions to filter vectors to delete.
             namespace: Namespace to search in. Default will search in '' namespace.
+            async_req: Whether runs asynchronously.
         """
 
         if namespace is None:
             namespace = self._namespace
 
-        if delete_all:
-            self._index.delete(delete_all=True, namespace=namespace, **kwargs)
-        elif ids is not None:
-            chunk_size = 1000
-            for i in range(0, len(ids), chunk_size):
-                chunk = ids[i : i + chunk_size]
-                self._index.delete(ids=chunk, namespace=namespace, **kwargs)
-        elif filter is not None:
-            self._index.delete(filter=filter, namespace=namespace, **kwargs)
-        else:
-            raise ValueError("Either ids, delete_all, or filter must be provided.")
+        try:
+            if delete_all:
+                responses = [self._index.delete(delete_all=True, namespace=namespace, async_req=async_req,**kwargs)]
+            elif ids is not None:
+               responses =  [
+                    self._index.delete(
+                        ids=batch_ids,
+                        namespace=namespace,
+                        async_req=async_req,
+                        **kwargs,
+                    )
+                    for batch_ids in batch_iterate(batch_size, ids)
+                ]
+            elif filter is not None:
+                responses = [self._index.delete(filter=filter, namespace=namespace, async_req=async_req,**kwargs)]
+            else:
+                raise ValueError("Either ids, delete_all, or filter must be provided.")
+            
+            [wait_result(response, async_req) for response in responses]
+        except Exception as exception:
+            if not ((NotFoundException and isinstance(exception, NotFoundException)) or
+                    (RpcError and isinstance(exception.__cause__, RpcError) and exception.__cause__.code() == StatusCode.NOT_FOUND)):
+                raise exception
 
         return None
 

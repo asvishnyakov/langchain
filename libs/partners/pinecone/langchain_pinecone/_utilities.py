@@ -1,5 +1,9 @@
+from __future__ import annotations
+
+from concurrent.futures import Future
 from enum import Enum
-from typing import List, Union
+from multiprocessing.pool import ApplyResult
+from typing import List, Union, TypeVar
 
 import numpy as np
 
@@ -76,3 +80,14 @@ def cosine_similarity(X: Matrix, Y: Matrix) -> np.ndarray:
             similarity = np.dot(X, Y.T) / np.outer(X_norm, Y_norm)
         similarity[np.isnan(similarity) | np.isinf(similarity)] = 0.0
         return similarity
+
+T = TypeVar("T")
+
+def wait_result(response: Future[T] | ApplyResult[T] | T, async_req: bool) -> T:
+    if async_req:
+        if isinstance(response, Future):
+            return response.result()
+        else:
+            return response.get()
+    else:
+        return response
