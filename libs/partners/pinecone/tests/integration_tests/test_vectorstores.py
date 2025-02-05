@@ -1,13 +1,10 @@
-import importlib
 import os
 import sys
 import time
 import uuid
-from importlib import reload
 from typing import List
 
 import numpy as np
-import pinecone  # type: ignore
 import pytest  # type: ignore[import-not-found]
 from langchain_core.documents import Document
 from langchain_core.vectorstores import VectorStore
@@ -28,12 +25,16 @@ def add_delay(delay_seconds):
     return decorator
 
 class TestPinecone(VectorStoreIntegrationTests):
-    index: "pinecone.grpc.GRPCIndex"
-    pc: "pinecone.grpc.PineconeGRPC"
-
-    def setup_class(cls) -> None:
+    @classmethod
+    @pytest.fixture(scope="class", autouse=True, params=["http", "grpc"])
+    def langchain_pinecone(cls, request, class_mocker: MockerFixture):
+        if request.param == "http":
+            mock = class_mocker.patch.dict(sys.modules, {"pinecone.grpc": None})
+            from pinecone import Pinecone as PineconeClient
+        else:
+            mock = None
+            from pinecone.grpc import PineconeGRPC as PineconeClient
         from pinecone import ServerlessSpec
-        from pinecone.grpc import PineconeGRPC as PineconeClient
 
         client = PineconeClient(api_key=os.environ["PINECONE_API_KEY"])
         if INDEX_NAME in client.list_indexes().names():
@@ -47,19 +48,14 @@ class TestPinecone(VectorStoreIntegrationTests):
             spec=ServerlessSpec(cloud="aws", region="us-east-1"),
         )
 
-        cls.index = client.Index(INDEX_NAME)
-        cls.client = client
-
-    @classmethod
-    def teardown_class(cls) -> None:
-        cls.client.delete_index(INDEX_NAME)
-
-    @pytest.fixture(scope="class", params=[False, True], ids=["http", "grpc"])
-    def langchain_pinecone(self, request, class_mocker: MockerFixture):
-        if not request.param:
-            class_mocker.patch.dict(sys.modules, {"pinecone.grpc": None})
         import langchain_pinecone
-        return langchain_pinecone
+        
+        yield langchain_pinecone
+
+        client.delete_index(INDEX_NAME)
+        
+        if mock:
+            class_mocker.stop(mock)
 
     @pytest.fixture
     def vectorstore(self, request, mocker: MockerFixture, langchain_pinecone) -> VectorStore:
